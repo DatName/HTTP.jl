@@ -1,26 +1,44 @@
 module WebSockets
 
-using Base64, LoggingExtras, UUIDs, Sockets, Random
+using Base64
+using Dates
+using LoggingExtras
+using Sockets
+using Random
 using MbedTLS: digest, MD_SHA1, SSLContext
-using ..IOExtras, ..Streams, ..Connections, ..Messages, ..Conditions, ..Servers
+using UUIDs
+
+using ..Conditions
+using ..Conditions
+using ..Connections
+using ..Servers
+using ..Streams
+using ..IOExtras
+using ..Messages
+
 using ..Exceptions: current_exceptions_to_string
 import ..open
 import ..HTTP # for doc references
 
-export WebSocket, send, receive, ping, pong
+export WebSocket
+
+export pong
+export ping
+export receive
+export send
 
 # 1st 2 bytes of a frame
 primitive type FrameFlags 16 end
 uint16(x::FrameFlags) = Base.bitcast(UInt16, x)
 FrameFlags(x::UInt16) = Base.bitcast(FrameFlags, x)
 
-const WS_FINAL =  0b1000000000000000
-const WS_RSV1 =   0b0100000000000000
-const WS_RSV2 =   0b0010000000000000
-const WS_RSV3 =   0b0001000000000000
-const WS_OPCODE = 0b0000111100000000
-const WS_MASK =   0b0000000010000000
-const WS_LEN =    0b0000000001111111
+global const WS_FINAL =  0b1000000000000000
+global const WS_RSV1 =   0b0100000000000000
+global const WS_RSV2 =   0b0010000000000000
+global const WS_RSV3 =   0b0001000000000000
+global const WS_OPCODE = 0b0000111100000000
+global const WS_MASK =   0b0000000010000000
+global const WS_LEN =    0b0000000001111111
 
 @enum OpCode::UInt8 CONTINUATION=0x00 TEXT=0x01 BINARY=0x02 CLOSE=0x08 PING=0x09 PONG=0x0A
 
@@ -59,6 +77,7 @@ Base.show(io::IO, x::FrameFlags) =
     print(io, "FrameFlags(", "final=", x.final, ", ", "opcode=", x.opcode, ", ", "masked=", x.masked, ", ", "len=", x.len, ")")
 
 primitive type Mask 32 end
+
 Base.UInt32(x::Mask) = Base.bitcast(UInt32, x)
 Mask(x::UInt32) = Base.bitcast(Mask, x)
 Base.getindex(x::Mask, i::Int) = (UInt32(x) >> (8 * ((i - 1) % 4))) % UInt8
@@ -66,17 +85,38 @@ mask() = Mask(rand(Random.RandomDevice(), UInt32))
 const EMPTY_MASK = Mask(UInt32(0))
 
 # representation of a single websocket frame
-struct Frame
-    flags::FrameFlags
-    extendedlen::Union{Nothing, UInt16, UInt64}
-    mask::Mask
+mutable struct Frame{T}
+    flags       ::FrameFlags
+    extendedlen ::Union{Nothing, UInt16, UInt64}
+    mask        ::Mask
     # when sending, Vector{UInt8} if client, any AbstractVector{UInt8} if server
     # when receiving:
       # CONTINUATION: String or Vector{UInt8} based on first fragment frame opcode TEXT/BINARY
       # TEXT: String
       # BINARY/PING/PONG: Vector{UInt8}
       # CLOSE: CloseFrameBody
-    payload::Any
+
+    payload::T
+
+    receive_starts   ::UInt64
+    received_at      ::UInt64
+    num_parts        ::Int64
+end
+
+function nparts(this::Frame)
+    return this.num_parts
+end
+
+function receive_starts_at(this::Frame)
+    return this.receive_starts
+end
+
+function data_size(this::Frame)
+    return sizeof(this.payload)
+end
+
+function receive_duration(this::Frame)::Nanosecond
+    return Nanosecond(this.received_at - this.receive_starts)
 end
 
 # given a payload total length, split into 7-bit length + 16-bit or 64-bit extended length
@@ -89,19 +129,36 @@ function mask!(bytes::Vector{UInt8}, mask)
     for i in 1:length(bytes)
         @inbounds bytes[i] = bytes[i] ⊻ mask[i]
     end
+
     return
 end
 
 # send method Frame constructor
-function Frame(final::Bool, opcode::OpCode, client::Bool, payload::AbstractVector{UInt8}; rsv1::Bool=false, rsv2::Bool=false, rsv3::Bool=false)
+function Frame(final::Bool, opcode::OpCode, client::Bool, payload::Vector{UInt8}; rsv1::Bool=false, rsv2::Bool=false, rsv3::Bool=false)
     len, extlen = wslength(length(payload))
+
     if client
         msk = mask()
         mask!(payload, msk)
     else
         msk = EMPTY_MASK
     end
-    return Frame(FrameFlags(final, opcode, client, len; rsv1, rsv2, rsv3), extlen, msk, payload)
+
+    return Frame(
+        FrameFlags(
+            final,
+            opcode,
+            client,
+            len;
+            rsv1, rsv2, rsv3
+        ),
+        extlen,
+        msk,
+        payload,
+        UInt64(0),
+        UInt64(0),
+        0
+    )
 end
 
 Base.show(io::IO, x::Frame) =
@@ -124,20 +181,23 @@ Frame may also be part of fragmented message, with opcdoe `CONTINUATION`;
 `first_fragment_opcode` should be passed from the 1st frame of a fragmented message
 to ensure each subsequent frame payload is converted correctly (String or Vector{UInt8}).
 """
-function readframe(io::IO, ::Type{Frame}, buffer::Vector{UInt8}=UInt8[], first_fragment_opcode::OpCode=CONTINUATION)
+function readframe(io::IO, ::Type{F}, buffer::Vector{UInt8}=UInt8[], first_fragment_opcode::OpCode=CONTINUATION)::F where {F <: Frame}
     iocheck(io)
     flags = FrameFlags(ntoh(read(io, UInt16)))
-    if flags.len == 0x7E
-        extlen = ntoh(read(io, UInt16))
-        len = UInt64(extlen)
+    receive_starts = time_ns()
+
+    len, extlen = if flags.len == 0x7E
+        l = ntoh(read(io, UInt16))
+        UInt64(l), l
     elseif flags.len == 0x7F
-        extlen = ntoh(read(io, UInt64))
-        len = extlen
+        l = ntoh(read(io, UInt64))
+        l, l
     else
-        extlen = nothing
-        len = UInt64(flags.len)
+        UInt64(flags.len), nothing
     end
+
     mask = flags.masked ? Mask(read(io, UInt32)) : EMPTY_MASK
+
     # even if len is 0, we need to resize! so previously filled buffers aren't erroneously reused
     resize!(buffer, len)
     if len > 0
@@ -148,36 +208,52 @@ function readframe(io::IO, ::Type{Frame}, buffer::Vector{UInt8}=UInt8[], first_f
         # and then write out to the out_io.
         read!(io, buffer)
     end
+
     if flags.masked
         mask!(buffer, mask)
     end
+
     if flags.opcode == CONTINUATION && first_fragment_opcode == CONTINUATION
         throw(WebSocketError(CloseFrameBody(1002, "Continuation frame cannot be the first frame in a message")))
     elseif first_fragment_opcode != CONTINUATION && flags.opcode in (TEXT, BINARY)
         throw(WebSocketError(CloseFrameBody(1002, "Received unfragmented frame while still processing fragmented frame")))
     end
+
     op = flags.opcode == CONTINUATION ? first_fragment_opcode : flags.opcode
-    if op == TEXT
+    payload = if op == TEXT
         # TODO: possible avoid the double copy from read!(io, buffer) + unsafe_string?
-        payload = unsafe_string(pointer(buffer), len)
+        unsafe_string(pointer(buffer), len)
     elseif op == CLOSE
         if len == 1
             throw(WebSocketError(CloseFrameBody(1002, "Close frame cannot have body of length 1")))
         end
+
         control_len_check(len)
-        if len >= 2
+        status = if len >= 2
             st = Int(UInt16(buffer[1]) << 8 | buffer[2])
             validclosecheck(st)
-            status = st
+            st
         else
-            status = 1005
+            1005
         end
+
         payload = CloseFrameBody(status, len > 2 ? unsafe_string(pointer(buffer) + 2, len - 2) : "")
         utf8check(payload.message)
+
+        payload
     else # BINARY
-        payload = copy(buffer)
+        copy(buffer)
     end
-    return Frame(flags, extlen, mask, payload)
+
+    return Frame(
+        flags,
+        extlen,
+        mask,
+        payload,
+        receive_starts,
+        UInt64(0),
+        0
+    )
 end
 
 # writing a single frame
@@ -296,7 +372,7 @@ mutable struct WebSocket
     writeclosed::Bool
 end
 
-const DEFAULT_MAX_FRAG = 1024
+global const DEFAULT_MAX_FRAG = 1024
 
 IOExtras.tcpsocket(ws::WebSocket) = tcpsocket(ws.io)
 
@@ -510,15 +586,15 @@ Control frames can be sent by calling `ping(ws[, data])`, `pong(ws[, data])`,
 or `close(ws[, body::WebSockets.CloseFrameBody])`. Calling `close` will initiate
 the close sequence and close the underlying connection.
 """
-function Sockets.send(ws::WebSocket, x)
+function Sockets.send(ws::WebSocket, msg)
     @debugv 2 "$(ws.id): Writing non-control message"
     @require !ws.writeclosed
-    if !isbinary(x) && !istext(x)
+    if !isbinary(msg) && !istext(msg)
         # if x is not single binary or text, then assume it's an iterable of binary or text
         # and we'll send fragmented message
         first = true
         n = 0
-        state = iterate(x)
+        state = iterate(msg)
         if state === nothing
             # x was not binary or text, but is an empty iterable, send single empty frame
             x = ""
@@ -528,18 +604,18 @@ function Sockets.send(ws::WebSocket, x)
         item, st = state
         # we prefetch next state so we know if we're on the last item or not
         # so we can appropriately set the FIN bit for the last fragmented frame
-        nextstate = iterate(x, st)
+        nextstate = iterate(msg, st)
         while true
             n += writeframe(ws.io, Frame(nextstate === nothing, first ? opcode(item) : CONTINUATION, ws.client, payload(ws, item)))
             first = false
             nextstate === nothing && break
             item, st = nextstate
-            nextstate = iterate(x, st)
+            nextstate = iterate(msg, st)
         end
     else
         # single binary or text frame for message
 @label write_single_frame
-        return writeframe(ws.io, Frame(true, opcode(x), ws.client, payload(ws, x)))
+        return writeframe(ws.io, Frame(true, opcode(msg), ws.client, payload(ws, msg)))
     end
 end
 
@@ -582,10 +658,17 @@ and the connection is closed. If a CLOSE frame hasn't already been received, the
 CLOSE frame is sent and `receive` is attempted to receive the responding CLOSE
 frame.
 """
-function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, ""))
+function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, ""); force::Bool = false)
     isclosed(ws) && return
     @debugv 2 "$(ws.id): Closing websocket"
     ws.writeclosed = true
+
+    if force
+        ws.readclosed = true
+        close(ws.io)
+        return
+    end
+
     data = Vector{UInt8}(body.message)
     prepend!(data, reinterpret(UInt8, [hton(UInt16(body.status))]))
     try
@@ -650,6 +733,7 @@ function checkreadframe!(ws::WebSocket, frame::Frame)
     elseif frame.flags.final && frame.flags.opcode == TEXT && frame.payload isa String
         utf8check(frame.payload)
     end
+
     return frame.flags.final
 end
 
@@ -700,6 +784,60 @@ function receive(ws::WebSocket)
     payload isa String && utf8check(payload)
     @debugv 2 "Read message: $(payload[1:min(1024, sizeof(payload))])"
     return payload
+end
+
+
+function receive(::Type{F}, ws::WebSocket) where {F <: Frame}
+    # TODO rewrite with `receive!(::Frame{T}, ...)`
+
+    @require !ws.readclosed
+
+    frame = readframe(ws.io, F, ws.readbuffer)
+
+    # * common case of reading single non-control frame
+    done = checkreadframe!(ws, frame)
+    if done
+        frame.received_at = time_ns()
+        frame.num_parts = 1
+        return frame
+    end
+
+    opcode = frame.flags.opcode
+    if iscontrol(opcode)
+        return receive(F, ws)
+    end
+
+    # * if we're here, we're reading a fragmented message
+    payload = frame.payload
+
+    while true
+        next_frame = readframe(ws.io, F, ws.readbuffer, opcode)
+        frame.num_parts += 1
+
+        done = checkreadframe!(ws, next_frame)
+
+        if !iscontrol(next_frame.flags.opcode)
+            payload = _append(payload, next_frame.payload)
+        end
+
+        done && break
+    end
+
+    payload isa String && utf8check(payload)
+
+    frame.payload = payload # ! 
+    frame.received_at = time_ns()
+
+    return frame
+end
+
+struct FrameIterator
+    ws  ::WebSocket
+end
+
+function Base.iterate(this::FrameIterator, st=nothing)
+    isclosed(this.ws) && return nothing
+    return (receive(Frame, this.ws), nothing)
 end
 
 """
