@@ -210,7 +210,7 @@ function Base.unsafe_read(c::Connection, p::Ptr{UInt8}, n::UInt)
     return nothing
 end
 
-function read_to_buffer(c::Connection, sizehint=4096)
+function read_to_buffer(c::Connection, sizehint=8192)
     buf = c.buffer
 
     # Reset the buffer if it is empty.
@@ -513,6 +513,7 @@ function getconnection(::Type{TCPSocket},
                        # keep up with midflight requests
                        keepalive::Bool=true,
                        readtimeout::Int=0,
+                       buffer::IOBuffer=PipeBuffer(),
                        kw...)::TCPSocket
 
     p::UInt = isempty(port) ? UInt(80) : parse(UInt, port)
@@ -521,7 +522,9 @@ function getconnection(::Type{TCPSocket},
     err = ErrorException("failed to connect")
     for addr in addrs
         try
-            tcp = Sockets.connect(addr, p)
+            tcp = TCPSocket(; delay = false)
+            tcp.buffer = buffer
+            Sockets.connect(tcp, addr, p)
             keepalive && keepalive!(tcp)
             return tcp
         catch e
@@ -567,6 +570,7 @@ end
 function getconnection(::Type{SSLContext},
                        host::AbstractString,
                        port::AbstractString;
+                       tcp::Union{TCPSocket, Nothing} = nothing,
                        kw...)::SSLContext
 
     port = isempty(port) ? "443" : port
@@ -578,6 +582,7 @@ end
 function getconnection(::Type{SSLStream},
                        host::AbstractString,
                        port::AbstractString;
+                       tcp::Union{TCPSocket, Nothing} = nothing,
                        kw...)::SSLStream
 
     port = isempty(port) ? "443" : port
