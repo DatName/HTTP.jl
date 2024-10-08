@@ -279,8 +279,26 @@ function Base.unsafe_read(http::Stream, p::Ptr{UInt8}, n::UInt)
     nothing
 end
 
+_alloc_request(buf::IOBuffer, recommended_size::UInt) = Base.alloc_request(buf, recommended_size)
+
+@static if VERSION < v"1.11"
+    function _alloc_request(buffer::Base.GenericIOBuffer, recommended_size::UInt)
+        Base.ensureroom(buffer, Int(recommended_size))
+        ptr = buffer.append ? buffer.size + 1 : buffer.ptr
+        nb = min(length(buffer.data), buffer.maxsize) - ptr + 1
+        return (Ptr{Cvoid}(pointer(buffer.data, ptr)), nb)
+    end
+else
+    function _alloc_request(buffer::Base.GenericIOBuffer, recommended_size::UInt)
+        Base.ensureroom(buffer, Int(recommended_size))
+        ptr = buffer.append ? buffer.size + 1 : buffer.ptr
+        nb = min(length(buffer.data)-buffer.offset, buffer.maxsize) + buffer.offset - ptr + 1
+        return (Ptr{Cvoid}(pointer(buffer.data, ptr)), nb)
+    end
+end
+
 function Base.readbytes!(http::Stream, buf::Base.GenericIOBuffer, n=bytesavailable(http))
-    p, nbmax = Base.alloc_request(buf, UInt(n))
+    p, nbmax = _alloc_request(buf, UInt(n))
     nbmax < n && throw(ArgumentError("Unable to grow response stream IOBuffer $nbmax large enough for response body size: $n"))
     GC.@preserve buf unsafe_read(http, p, UInt(n))
     # TODO: use `Base.notify_filled(buf, Int(n))` here, but only once it is identical to this:
